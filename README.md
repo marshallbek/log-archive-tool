@@ -2,6 +2,8 @@
 
 A simple Bash tool that compresses a log directory into a timestamped `.tar.gz` archive and optionally syncs it to a remote server via `rsync` over SSH.
 
+Project URL: https://roadmap.sh/projects/log-archive-tool
+
 ## Features
 
 - Compresses any log directory into a timestamped `.tar.gz`
