@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# =============================================================================
+# log-archive — compress and archive logs from a given directory
+# Usage: log-archive <log-directory>
+# =============================================================================
+
+set -euo pipefail
+# set -e  → exit immediately if any command fails
+# set -u  → treat unset variables as errors
+# set -o pipefail → catch errors in piped commands (e.g. cmd1 | cmd2)
+
+# --- Constants ---------------------------------------------------------------
+REMOTE_USER="logarchiver"                  # user to own the archives (optional)
+REMOTE_HOST=""                             #  hostname or IP of remote server for archive transfer (optional)  
+REMOTE_DIR="/backcups/log_archives"        # remote directory to store archives (optional)
+SSH_KEY="~/.ssh/id_ed25519_log-archiver"   # SSH key for remote transfers (optional)
+ARCHIVE_BASE_DIR="${HOME}/log_archives"    # where archives will be stored
+LOG_FILE="${ARCHIVE_BASE_DIR}/archive.log" # activity log file
+
+# --- Colors (optional, makes output readable) --------------------------------
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color (reset)
+
+# --- Helper functions --------------------------------------------------------
+
+usage() {
+  echo "Usage: log-archive <log-directory>"
+  echo ""
+  echo "  Compresses all files in <log-directory> into a timestamped .tar.gz"
+  echo "  and stores the archive in: ${ARCHIVE_BASE_DIR}"
+  echo ""
+  echo "Example:"
+  echo "  log-archive /var/log"
+}
+
+log_activity() {
+  # Append a timestamped message to the activity log
+  local message="$1"
+  local timestamp
+  timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[${timestamp}] ${message}" >> "${LOG_FILE}"
+}
+
+# --- Argument validation -----------------------------------------------------
+
+# Show usage if no argument provided
+if [ $# -eq 0 ]; then
+  echo -e "${RED}Error: No log directory specified.${NC}"
+  echo ""
+  usage
+  exit 1
+fi
+
+LOG_DIR="$1"
+
+# Check that the argument is actually a directory
+if [ ! -d "${LOG_DIR}" ]; then
+  echo -e "${RED}Error: '${LOG_DIR}' is not a valid directory.${NC}"
+  exit 1
+fi
+
+# Check that the directory is readable
+if [ ! -r "${LOG_DIR}" ]; then
+  echo -e "${RED}Error: '${LOG_DIR}' is not readable. Try running with sudo.${NC}"
+  exit 1
+fi
+
+# --- Setup archive directory --------------------------------------------------
+
+# Create the archive base directory if it doesn't exist
+mkdir -p "${ARCHIVE_BASE_DIR}"
+
+# --- Generate archive name with timestamp ------------------------------------
+
+# Format: logs_archive_YYYYMMDD_HHMMSS.tar.gz
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+ARCHIVE_NAME="logs_archive_${TIMESTAMP}.tar.gz"
+ARCHIVE_PATH="${ARCHIVE_BASE_DIR}/${ARCHIVE_NAME}"
+
+# --- Compress and archive ----------------------------------------------------
+
+echo -e "${YELLOW}Archiving logs from:${NC} ${LOG_DIR}"
+echo -e "${YELLOW}Archive will be saved to:${NC} ${ARCHIVE_PATH}"
+echo ""
+
+# tar flags:
+#   -c  create a new archive
+#   -z  compress with gzip
+#   -f  output file name
+#   -p  preserve file permissions
+#   --ignore-failed-read  skip files that can't be read (e.g. permission denied on some /var/log files)
+if tar \
+    -czpf "${ARCHIVE_PATH}" \
+    --ignore-failed-read \
+    -C "$(dirname "${LOG_DIR}")" \
+    "$(basename "${LOG_DIR}")" 2>/dev/null; then
+
+  # Get the size of the created archive
+  ARCHIVE_SIZE=$(du -sh "${ARCHIVE_PATH}" | cut -f1)
+
+  echo -e "${GREEN}✓ Archive created successfully!${NC}"
+  echo -e "  File : ${ARCHIVE_PATH}"
+  echo -e "  Size : ${ARCHIVE_SIZE}"
+
+  # Log the successful archive event
+  log_activity "SUCCESS | source=${LOG_DIR} | archive=${ARCHIVE_NAME} | size=${ARCHIVE_SIZE}"
+
+else
+  echo -e "${RED}✗ Archive failed.${NC}"
+  log_activity "FAILURE | source=${LOG_DIR} | archive=${ARCHIVE_NAME}"
+  exit 1
+fi
+
+echo ""
+echo -e "${YELLOW}Activity logged to:${NC} ${LOG_FILE}"
+
+
+
+# --- Step 2: Sync to remote server -------------------------------------------
+
+if [ "${REMOTE_ENABLED}" = true ]; then
+  echo ""
+  echo -e "${YELLOW}[2/2] Syncing to remote server...${NC}"
+  echo -e "      Destination : ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
+  echo ""
+
+  # Check SSH key exists
+  if [ ! -f "${SSH_KEY}" ]; then
+    echo -e "${RED}      ✗ SSH key not found at '${SSH_KEY}'.${NC}"
+    echo -e "        Generate one with: ssh-keygen -t ed25519"
+    log_activity "RSYNC_FAILURE | reason=ssh_key_missing | key=${SSH_KEY}"
+    exit 1
+  fi
+
+  # rsync flags:
+  #   -a            archive mode (preserves permissions, timestamps, symlinks)
+  #   -v            verbose output
+  #   -z            compress data during transfer
+  #   --progress    show transfer progress
+  #   -e "ssh -i"   use specific SSH key
+  #   --mkpath      create remote directory if it doesn't exist (rsync 3.2.3+)
+
+  if rsync \
+      -avz \
+      --progress \
+      -e "ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no" \
+      --mkpath \
+      "${ARCHIVE_PATH}" \
+      "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"; then
+
+    echo ""
+    echo -e "${GREEN}      ✓ Sync complete.${NC}"
+    log_activity "RSYNC_SUCCESS | archive=${ARCHIVE_NAME} | destination=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
+
+  else
+    echo ""
+    echo -e "${RED}      ✗ Sync failed. Archive is still saved locally.${NC}"
+    log_activity "RSYNC_FAILURE | archive=${ARCHIVE_NAME} | destination=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
+    exit 1
+  fi
+
+else
+  echo ""
+  echo -e "${BLUE}[2/2] Remote sync is disabled. Skipping.${NC}"
+fi
+
+# --- Summary -----------------------------------------------------------------
+
+echo ""
+echo -e "${GREEN}Done.${NC}"
+echo -e "  Local archive : ${ARCHIVE_PATH}"
+if [ "${REMOTE_ENABLED}" = true ]; then
+  echo -e "  Remote copy   : ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/${ARCHIVE_NAME}"
+fi
+echo -e "  Activity log  : ${LOG_FILE}"
